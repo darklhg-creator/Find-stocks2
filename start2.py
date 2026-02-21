@@ -1,140 +1,154 @@
-import requests
-from pykrx import stock
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+import FinanceDataReader as fdr
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
+import time
+import warnings
 
-# 🔴 [수정 완료] 새로운 디스코드 웹후크 URL 적용
-WEBHOOK_URL = "https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT"
+# 경고 메시지 숨기기 (가독성 향상)
+warnings.filterwarnings('ignore')
 
-def send_discord_message(msg_content):
-    """디스코드로 메시지를 전송하는 함수"""
-    payload = {"content": msg_content}
+def get_rsi(df, period=14):
+    """
+    일반적인 HTS/MTS와 동일한 지수이동평균(EMA) 방식의 RSI 계산 함수
+    """
+    delta = df['Close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    
+    # com = period - 1
+    ema_up = up.ewm(com=period-1, adjust=False).mean()
+    ema_down = down.ewm(com=period-1, adjust=False).mean()
+    
+    rs = ema_up / ema_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def is_recent_operating_profit_positive(ticker_code):
+    """
+    네이버 금융을 스크래핑하여 가장 최근 발표된 공시 기준 영업이익이 흑자인지 확인
+    (연간/분기 실적 테이블을 우선적으로 확인)
+    """
     try:
-        response = requests.post(WEBHOOK_URL, json=payload)
-        if response.status_code == 204:
-            print("✅ 디스코드 알림 전송 완료!")
-        else:
-            print(f"⚠️ 디스코드 전송 실패 (상태 코드: {response.status_code})")
+        url = f"https://finance.naver.com/item/main.naver?code={ticker_code}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers)
+        
+        # 네이버 금융 메인 페이지의 재무제표 표 추출
+        tables = pd.read_html(res.text, encoding='euc-kr')
+        
+        # 일반적으로 3번째(인덱스 3) 표가 '기업실적분석' 테이블입니다.
+        finance_table = tables[3]
+        
+        # 다중 컬럼 인덱스를 평탄화
+        finance_table.columns = ['_'.join(str(c) for c in col).strip() for col in finance_table.columns]
+        
+        # '영업이익'이 포함된 행 찾기
+        op_row = finance_table[finance_table.iloc[:, 0].str.contains('영업이익', na=False)]
+        
+        if op_row.empty:
+            return False # 데이터를 찾을 수 없으면 보수적으로 제외
+            
+        # 가장 최근 분기 또는 연간 데이터 값 추출 (보통 오른쪽 끝에서 두 번째 또는 세 번째 열이 최근 실적)
+        # NaN이나 텍스트를 제거하고 숫자로 변환
+        recent_values = pd.to_numeric(op_row.iloc[0, -4:], errors='coerce').dropna()
+        
+        if len(recent_values) > 0:
+            latest_op = recent_values.iloc[-1]
+            return latest_op > 0 # 영업이익이 0보다 크면 True (흑자)
+            
+        return False
+        
     except Exception as e:
-        print(f"❌ 디스코드 전송 중 에러 발생: {e}")
+        print(f"[{ticker_code}] 재무 데이터 확인 중 오류 발생: {e}")
+        return False
 
 def main():
-    KST = timezone(timedelta(hours=9))
-    today_dt = datetime.now(KST)
+    print("=== 국내 주식 낙폭과대(RSI 40 이하) & 우량 유동성 & 흑자 기업 검색 시작 ===")
     
-    # 🌟 [주말 테스트 강제 세팅] 🌟
-    target_date = "20260220" # 금요일 데이터로 테스트
-    start_date = "20260115"
+    # 1. 국내 주식(코스피, 코스닥) 종목 코드 가져오기
+    krx_df = fdr.StockListing('KRX')
     
-    print(f"📅 실행일시: {today_dt.strftime('%Y-%m-%d %H:%M:%S')} (KST)")
-    print(f"🚀 [폭풍전야 눌림목 탐색 모드] {target_date} 기준으로 탐색을 시작합니다.")
-
-    # 🌟 실전에서는 아래 주석(#) 3줄을 지워서 주말 알림을 켜주세요! 🌟
-    # if today_dt.weekday() >= 5:
-    #     msg = f"💤 **[{today_dt.strftime('%Y-%m-%d')}]** 오늘은 주말(토/일)입니다. 탐색을 쉬어갑니다!"
-    #     send_discord_message(msg)
-    #     return
+    # 우선주, 스팩주 등 제외 (종목코드가 6자리 숫자로 끝나고, 마지막이 0인 보통주만 필터링)
+    krx_df = krx_df[krx_df['Code'].str.match(r'^\d{5}0$')]
+    tickers = krx_df['Code'].tolist()
+    names = krx_df['Name'].tolist()
+    ticker_dict = dict(zip(tickers, names))
     
-    try:
-        # 1. 오늘 주식 시세 가져오기
-        df_today = stock.get_market_ohlcv_by_ticker(target_date, market="ALL")
-        
-        if df_today.empty:
-            msg = f"💤 **[{target_date}]** 오늘 거래 데이터가 없습니다. (휴장일 판단)"
-            print(msg)
-            send_discord_message(msg)
-            return
-
-        # 2. [핵심] 재무 필터링: 최근 공시 기준 펀더멘털 데이터 수집 (EPS 흑자 확인용)
-        print("📊 재무 데이터(EPS)를 확인하여 흑자 기업만 1차로 걸러냅니다...")
-        df_fund = stock.get_market_fundamental_by_ticker(target_date, market="ALL")
-        
-        candidates = []
-        
-        # 3. 1차 필터링: 흑자 기업 & 스팩/우선주 제외 & 오늘 최소 거래대금 10억 이상
-        for ticker, row in df_today.iterrows():
-            name = stock.get_market_ticker_name(ticker)
+    # 분석 기준일 설정 (오늘 기준으로 100일 전까지의 데이터만 가져와서 속도 향상)
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=100)
+    
+    # 필터링 조건
+    MIN_MEDIAN_TRADING_VALUE = 3000000000  # 20일 중간값 기준 30억 원 이상
+    TARGET_RSI = 40                        # RSI 40 이하
+    
+    candidates = []
+    
+    print(f"총 {len(tickers)}개 보통주 종목에 대해 1차 기술적 필터링(RSI 및 중간값)을 진행합니다. 잠시만 기다려주세요...\n")
+    
+    for i, ticker in enumerate(tickers):
+        try:
+            # 주가 데이터 수집
+            df = fdr.DataReader(ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
             
-            # 노이즈 종목 제외
-            if "스팩" in name or name.endswith("우") or name.endswith("우B") or name.endswith("우C") or "리츠" in name:
+            if len(df) < 30: # 상장한 지 얼마 안 된 종목 제외
                 continue
                 
-            # EPS(주당순이익)가 0 이하인 적자 기업 철저히 배제
-            if ticker in df_fund.index:
-                eps = df_fund.loc[ticker, 'EPS']
-                if pd.isna(eps) or eps <= 0:
-                    continue
-            else:
-                continue # 재무 데이터 없으면 패스
+            # 1. 거래대금 중간값 조건 (평균의 함정 회피)
+            df['Trading_Value'] = df['Close'] * df['Volume']
+            # 최근 20일 거래대금의 '중간값' 계산
+            recent_median_value = df['Trading_Value'].rolling(window=20).median().iloc[-1]
             
-            try:
-                today_amt = row['거래대금']
-            except:
-                today_amt = row.iloc[3] * row.iloc[4]
+            if recent_median_value < MIN_MEDIAN_TRADING_VALUE:
+                continue
                 
-            today_close = row['종가']
-            today_change = row['등락률']
-            today_vol = row['거래량']
+            # 2. RSI 조건 확인
+            df['RSI'] = get_rsi(df)
+            current_rsi = df['RSI'].iloc[-1]
             
-            # 오늘 너무 많이 오르거나 내린 종목 제외 (±3% 이내의 눌림목만), 동전주 제외
-            if abs(today_change) <= 3.0 and today_close >= 1000 and today_amt >= 1_000_000_000:
-                candidates.append((ticker, name, today_close, today_vol, today_change))
+            if current_rsi <= TARGET_RSI:
+                # 1차 조건 통과한 종목만 리스트에 추가
+                candidates.append({
+                    'Code': ticker,
+                    'Name': ticker_dict[ticker],
+                    'RSI': round(current_rsi, 2),
+                    'Median_Value(억)': round(recent_median_value / 100000000, 1)
+                })
                 
-        print(f"🔍 1차 필터링: 조건에 맞는 흑자/눌림목 후보 {len(candidates)}개 발견. 과거 수급 분석 중...")
+        except Exception as e:
+            continue
+            
+    print(f"\n1차 조건(유동성 중간값 충족 & RSI {TARGET_RSI} 이하)을 통과한 종목은 총 {len(candidates)}개입니다.")
+    print("이제 해당 종목들의 가장 최근 공시 기준 '영업이익 흑자' 여부를 실시간으로 확인합니다...\n")
+    
+    final_picks = []
+    
+    for idx, cand in enumerate(candidates):
+        ticker = cand['Code']
+        name = cand['Name']
+        print(f"[{idx+1}/{len(candidates)}] {name}({ticker}) 영업이익 확인 중...", end="")
         
-        results = []
-        
-        # 4. 과거 20일 데이터와 비교 (거래량 급감 및 추세 확인)
-        for ticker, name, today_close, today_vol, today_change in candidates:
-            df = stock.get_market_ohlcv_by_date(start_date, target_date, ticker)
-            
-            if df.empty or len(df) < 20: continue
-            
-            past_df = df.iloc[:-1].tail(20) # 오늘 제외 과거 20일
-            avg_vol = past_df['거래량'].mean()
-            avg_amt = (past_df['종가'] * past_df['거래량']).mean()
-            ma_20_close = past_df['종가'].mean() # 20일 이동평균선
-            
-            if avg_vol > 0:
-                vol_ratio = today_vol / avg_vol
-                
-                # [선취매 최종 조건]
-                # 1. 20일 평균 거래대금 50억 이상 (원래 끼가 있는 주도주)
-                # 2. 오늘 종가가 20일 이평선 위 (상승 추세 안 깨짐)
-                # 3. 오늘 거래량이 평균의 35% 이하로 바짝 마름
-                if avg_amt >= 5_000_000_000 and today_close >= ma_20_close and vol_ratio <= 0.35:
-                    results.append({
-                        '종목명': name,
-                        '거래비율(%)': round(vol_ratio * 100, 1), # 거래량이 평균의 몇 %인지
-                        '평균대금(억)': round(avg_amt / 100_000_000, 1),
-                        '오늘등락(%)': round(today_change, 2)
-                    })
-
-        # 5. 결과 정렬 (거래량이 가장 심하게 마른 순서대로) 및 디스코드 전송
-        if results:
-            # 거래비율이 '낮은' 순서대로 정렬 (완벽하게 메말라버린 종목이 1위)
-            final_df = pd.DataFrame(results).sort_values(by='거래비율(%)', ascending=True).head(30)
-            
-            print("\n" + "=" * 60)
-            print(f"🤫 [폭풍전야: 수급 응축 및 눌림목 TOP 30]")
-            print("-" * 60)
-            print(final_df.to_string(index=False))
-            print("=" * 60)
-            
-            # 디스코드 메시지
-            discord_msg = f"🤫 **[폭풍전야: 수급 응축 눌림목 TOP 30]** (테스트 - {target_date})\n"
-            discord_msg += "```text\n"
-            discord_msg += final_df.to_string(index=False) + "\n"
-            discord_msg += "```\n"
-            discord_msg += "💡 (조건) 흑자 기업 + 20일선 위 + 변동성 3% 이내 + **평소 대비 거래량 35% 이하 급감**"
-            
-            send_discord_message(discord_msg)
-            
+        # 3. 최근 공시 기준 영업이익 흑자 확인 (네이버 금융 실시간 스크래핑)
+        if is_recent_operating_profit_positive(ticker):
+            print(" 흑자 확인! (편입)")
+            final_picks.append(cand)
         else:
-            print("조건에 맞는 눌림목 종목이 없습니다.")
-
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
+            print(" 적자 또는 데이터 없음 (제외)")
+            
+        time.sleep(0.5) # 서버 부하 방지를 위한 딜레이
+        
+    print("\n" + "="*50)
+    print("🏆 [최종 검색 결과] 🏆")
+    print("="*50)
+    if not final_picks:
+        print("현재 모든 조건을 만족하는 종목이 없습니다.")
+    else:
+        result_df = pd.DataFrame(final_picks)
+        # RSI가 낮은 순으로 정렬하여 출력
+        result_df = result_df.sort_values(by='RSI', ascending=True).reset_index(drop=True)
+        print(result_df.to_string())
 
 if __name__ == "__main__":
     main()
