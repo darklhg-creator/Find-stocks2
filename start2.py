@@ -6,18 +6,16 @@ from datetime import datetime, timedelta
 import time
 import warnings
 
-# 경고 메시지 숨기기 (가독성 향상)
+# 불필요한 경고 메시지 끄기
 warnings.filterwarnings('ignore')
 
 def get_rsi(df, period=14):
-    """
-    일반적인 HTS/MTS와 동일한 지수이동평균(EMA) 방식의 RSI 계산 함수
-    """
+    """지수이동평균(EMA) 방식의 RSI 계산 (HTS/MTS와 동일한 방식)"""
     delta = df['Close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     
-    # com = period - 1
+    # EMA를 사용하여 변동성 계산
     ema_up = up.ewm(com=period-1, adjust=False).mean()
     ema_down = down.ewm(com=period-1, adjust=False).mean()
     
@@ -26,129 +24,109 @@ def get_rsi(df, period=14):
     return rsi
 
 def is_recent_operating_profit_positive(ticker_code):
-    """
-    네이버 금융을 스크래핑하여 가장 최근 발표된 공시 기준 영업이익이 흑자인지 확인
-    (연간/분기 실적 테이블을 우선적으로 확인)
-    """
+    """네이버 금융 스크래핑을 통해 가장 최근 공시 기준 영업이익 흑자 여부 확인"""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker_code}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
         res = requests.get(url, headers=headers)
         
-        # 네이버 금융 메인 페이지의 재무제표 표 추출
+        # lxml 엔진을 사용하여 테이블 추출
         tables = pd.read_html(res.text, encoding='euc-kr')
         
-        # 일반적으로 3번째(인덱스 3) 표가 '기업실적분석' 테이블입니다.
+        # '기업실적분석' 테이블은 보통 4번째(인덱스 3)에 위치함
         finance_table = tables[3]
         
-        # 다중 컬럼 인덱스를 평탄화
+        # 다중 인덱스 평탄화 및 '영업이익' 행 찾기
         finance_table.columns = ['_'.join(str(c) for c in col).strip() for col in finance_table.columns]
-        
-        # '영업이익'이 포함된 행 찾기
         op_row = finance_table[finance_table.iloc[:, 0].str.contains('영업이익', na=False)]
         
         if op_row.empty:
-            return False # 데이터를 찾을 수 없으면 보수적으로 제외
+            return False
             
-        # 가장 최근 분기 또는 연간 데이터 값 추출 (보통 오른쪽 끝에서 두 번째 또는 세 번째 열이 최근 실적)
-        # NaN이나 텍스트를 제거하고 숫자로 변환
+        # 가장 최근 4개의 실적 데이터 중 마지막 값(최신 공시) 확인
         recent_values = pd.to_numeric(op_row.iloc[0, -4:], errors='coerce').dropna()
         
         if len(recent_values) > 0:
-            latest_op = recent_values.iloc[-1]
-            return latest_op > 0 # 영업이익이 0보다 크면 True (흑자)
+            return recent_values.iloc[-1] > 0 # 흑자면 True
             
         return False
-        
-    except Exception as e:
-        print(f"[{ticker_code}] 재무 데이터 확인 중 오류 발생: {e}")
+    except:
         return False
 
 def main():
-    print("=== 국내 주식 낙폭과대(RSI 40 이하) & 우량 유동성 & 흑자 기업 검색 시작 ===")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 국내 주식 주도주 및 낙폭과대 탐색 시작")
     
-    # 1. 국내 주식(코스피, 코스닥) 종목 코드 가져오기
-    krx_df = fdr.StockListing('KRX')
-    
-    # 우선주, 스팩주 등 제외 (종목코드가 6자리 숫자로 끝나고, 마지막이 0인 보통주만 필터링)
-    krx_df = krx_df[krx_df['Code'].str.match(r'^\d{5}0$')]
-    tickers = krx_df['Code'].tolist()
-    names = krx_df['Name'].tolist()
-    ticker_dict = dict(zip(tickers, names))
-    
-    # 분석 기준일 설정 (오늘 기준으로 100일 전까지의 데이터만 가져와서 속도 향상)
+    # 1. 국내 상장 종목 리스트 (보통주만 필터링)
+    try:
+        krx_df = fdr.StockListing('KRX')
+        # 종목코드가 6자리 숫자로 끝나고 '0'으로 끝나는 보통주만 선택
+        krx_df = krx_df[krx_df['Code'].str.match(r'^\d{5}0$')]
+        ticker_dict = dict(zip(krx_df['Code'], krx_df['Name']))
+    except Exception as e:
+        print(f"종목 리스트 확보 실패: {e}")
+        return
+
+    # 분석 범위: 최근 120일 데이터
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=100)
+    start_date = end_date - timedelta(days=120)
     
-    # 필터링 조건
-    MIN_MEDIAN_TRADING_VALUE = 3000000000  # 20일 중간값 기준 30억 원 이상
-    TARGET_RSI = 40                        # RSI 40 이하
+    # 필터링 기준 설정
+    MIN_MEDIAN_TRADING_VALUE = 3000000000  # 20일 거래대금 중간값 30억 원 이상
+    TARGET_RSI = 40                        # RSI 40 이하 (과매도 구간 진입)
     
     candidates = []
+    tickers = list(ticker_dict.keys())
     
-    print(f"총 {len(tickers)}개 보통주 종목에 대해 1차 기술적 필터링(RSI 및 중간값)을 진행합니다. 잠시만 기다려주세요...\n")
-    
-    for i, ticker in enumerate(tickers):
+    print(f"총 {len(tickers)}개 종목 분석 중... (거래대금 중간값 및 RSI 필터링)")
+
+    for ticker in tickers:
         try:
-            # 주가 데이터 수집
-            df = fdr.DataReader(ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+            df = fdr.DataReader(ticker, start_date, end_date)
+            if len(df) < 30: continue
             
-            if len(df) < 30: # 상장한 지 얼마 안 된 종목 제외
-                continue
-                
-            # 1. 거래대금 중간값 조건 (평균의 함정 회피)
+            # 거래대금 중간값 계산 (평균의 함정 회피)
             df['Trading_Value'] = df['Close'] * df['Volume']
-            # 최근 20일 거래대금의 '중간값' 계산
-            recent_median_value = df['Trading_Value'].rolling(window=20).median().iloc[-1]
+            recent_median = df['Trading_Value'].rolling(window=20).median().iloc[-1]
             
-            if recent_median_value < MIN_MEDIAN_TRADING_VALUE:
+            if recent_median < MIN_MEDIAN_TRADING_VALUE:
                 continue
                 
-            # 2. RSI 조건 확인
+            # RSI 지표 계산
             df['RSI'] = get_rsi(df)
             current_rsi = df['RSI'].iloc[-1]
             
             if current_rsi <= TARGET_RSI:
-                # 1차 조건 통과한 종목만 리스트에 추가
                 candidates.append({
                     'Code': ticker,
                     'Name': ticker_dict[ticker],
                     'RSI': round(current_rsi, 2),
-                    'Median_Value(억)': round(recent_median_value / 100000000, 1)
+                    '거래대금_중간값(억)': round(recent_median / 100000000, 1)
                 })
-                
-        except Exception as e:
+        except:
             continue
-            
-    print(f"\n1차 조건(유동성 중간값 충족 & RSI {TARGET_RSI} 이하)을 통과한 종목은 총 {len(candidates)}개입니다.")
-    print("이제 해당 종목들의 가장 최근 공시 기준 '영업이익 흑자' 여부를 실시간으로 확인합니다...\n")
+
+    print(f"\n✅ 기술적 조건 통과: {len(candidates)}종목. 이제 실시간 영업이익 흑자 여부를 검증합니다.")
     
     final_picks = []
-    
-    for idx, cand in enumerate(candidates):
-        ticker = cand['Code']
-        name = cand['Name']
-        print(f"[{idx+1}/{len(candidates)}] {name}({ticker}) 영업이익 확인 중...", end="")
-        
-        # 3. 최근 공시 기준 영업이익 흑자 확인 (네이버 금융 실시간 스크래핑)
-        if is_recent_operating_profit_positive(ticker):
-            print(" 흑자 확인! (편입)")
+    for cand in candidates:
+        # 네이버 금융 데이터로 최신 영업이익 확인
+        if is_recent_operating_profit_positive(cand['Code']):
             final_picks.append(cand)
-        else:
-            print(" 적자 또는 데이터 없음 (제외)")
-            
-        time.sleep(0.5) # 서버 부하 방지를 위한 딜레이
-        
-    print("\n" + "="*50)
-    print("🏆 [최종 검색 결과] 🏆")
-    print("="*50)
+        time.sleep(0.1) # 서버 부하 방지용 짧은 휴식
+
+    # 결과 출력
+    print("\n" + "="*70)
+    print(f"🏆 최종 필터링 결과 (RSI {TARGET_RSI} 이하 & 유동성 우량 & 흑자 기업)")
+    print("="*70)
+    
     if not final_picks:
-        print("현재 모든 조건을 만족하는 종목이 없습니다.")
+        print("현재 조건에 부합하는 종목이 없습니다.")
     else:
         result_df = pd.DataFrame(final_picks)
-        # RSI가 낮은 순으로 정렬하여 출력
-        result_df = result_df.sort_values(by='RSI', ascending=True).reset_index(drop=True)
-        print(result_df.to_string())
+        # RSI가 낮은 순(더 많이 과매도된 순)으로 정렬
+        result_df = result_df.sort_values(by='RSI').reset_index(drop=True)
+        print(result_df.to_string(index=False))
+    print("="*70)
 
 if __name__ == "__main__":
     main()
