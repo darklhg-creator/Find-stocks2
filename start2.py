@@ -5,93 +5,91 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import time
 import warnings
+import json
 
-# 불필요한 경고 메시지 끄기
+# 경고 메시지 무시
 warnings.filterwarnings('ignore')
 
+# ==========================================
+# 설정 구간: 여기에 디스코드 웹후크 URL을 입력하세요
+# ==========================================
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT" 
+
 def get_rsi(df, period=14):
-    """지수이동평균(EMA) 방식의 RSI 계산 (HTS/MTS와 동일한 방식)"""
+    """지수이동평균(EMA) 방식의 RSI 계산"""
     delta = df['Close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
-    
-    # EMA를 사용하여 변동성 계산
     ema_up = up.ewm(com=period-1, adjust=False).mean()
     ema_down = down.ewm(com=period-1, adjust=False).mean()
-    
     rs = ema_up / ema_down
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
 def is_recent_operating_profit_positive(ticker_code):
-    """네이버 금융 스크래핑을 통해 가장 최근 공시 기준 영업이익 흑자 여부 확인"""
+    """네이버 금융을 통해 최신 공시 기준 영업이익 흑자 여부 확인"""
     try:
         url = f"https://finance.naver.com/item/main.naver?code={ticker_code}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers)
-        
-        # lxml 엔진을 사용하여 테이블 추출
         tables = pd.read_html(res.text, encoding='euc-kr')
-        
-        # '기업실적분석' 테이블은 보통 4번째(인덱스 3)에 위치함
         finance_table = tables[3]
-        
-        # 다중 인덱스 평탄화 및 '영업이익' 행 찾기
         finance_table.columns = ['_'.join(str(c) for c in col).strip() for col in finance_table.columns]
         op_row = finance_table[finance_table.iloc[:, 0].str.contains('영업이익', na=False)]
         
-        if op_row.empty:
-            return False
-            
-        # 가장 최근 4개의 실적 데이터 중 마지막 값(최신 공시) 확인
+        if op_row.empty: return False
         recent_values = pd.to_numeric(op_row.iloc[0, -4:], errors='coerce').dropna()
-        
-        if len(recent_values) > 0:
-            return recent_values.iloc[-1] > 0 # 흑자면 True
-            
-        return False
+        return recent_values.iloc[-1] > 0 if len(recent_values) > 0 else False
     except:
         return False
 
-def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 국내 주식 주도주 및 낙폭과대 탐색 시작")
+def send_discord_message(payload):
+    """디스코드로 분석 결과 전송"""
+    if DISCORD_WEBHOOK_URL == "YOUR_DISCORD_WEBHOOK_URL_HERE":
+        print("⚠️ 디스코드 웹후크 URL이 설정되지 않았습니다. 결과만 출력합니다.")
+        return
     
-    # 1. 국내 상장 종목 리스트 (보통주만 필터링)
+    response = requests.post(
+        DISCORD_WEBHOOK_URL, 
+        data=json.dumps(payload),
+        headers={'Content-Type': 'application/json'}
+    )
+    if response.status_code == 204:
+        print("✅ 디스코드 메시지 전송 성공!")
+    else:
+        print(f"❌ 전송 실패: {response.status_code}")
+
+def main():
+    print("🚀 주식 분석 및 디스코드 알림 프로세스 시작...")
+    
     try:
         krx_df = fdr.StockListing('KRX')
-        # 종목코드가 6자리 숫자로 끝나고 '0'으로 끝나는 보통주만 선택
         krx_df = krx_df[krx_df['Code'].str.match(r'^\d{5}0$')]
         ticker_dict = dict(zip(krx_df['Code'], krx_df['Name']))
     except Exception as e:
-        print(f"종목 리스트 확보 실패: {e}")
+        print(f"데이터 로드 실패: {e}")
         return
 
-    # 분석 범위: 최근 120일 데이터
     end_date = datetime.today()
     start_date = end_date - timedelta(days=120)
     
-    # 필터링 기준 설정
-    MIN_MEDIAN_TRADING_VALUE = 3000000000  # 20일 거래대금 중간값 30억 원 이상
-    TARGET_RSI = 40                        # RSI 40 이하 (과매도 구간 진입)
+    # 필터 조건: 중간값 30억 이상, RSI 40 이하
+    MIN_MEDIAN_VALUE = 3000000000 
+    TARGET_RSI = 40
     
     candidates = []
     tickers = list(ticker_dict.keys())
     
-    print(f"총 {len(tickers)}개 종목 분석 중... (거래대금 중간값 및 RSI 필터링)")
-
     for ticker in tickers:
         try:
             df = fdr.DataReader(ticker, start_date, end_date)
             if len(df) < 30: continue
             
-            # 거래대금 중간값 계산 (평균의 함정 회피)
-            df['Trading_Value'] = df['Close'] * df['Volume']
-            recent_median = df['Trading_Value'].rolling(window=20).median().iloc[-1]
+            # 거래대금 중간값 (평균의 함정 방지)
+            df['Value'] = df['Close'] * df['Volume']
+            recent_median = df['Value'].rolling(window=20).median().iloc[-1]
             
-            if recent_median < MIN_MEDIAN_TRADING_VALUE:
-                continue
+            if recent_median < MIN_MEDIAN_VALUE: continue
                 
-            # RSI 지표 계산
             df['RSI'] = get_rsi(df)
             current_rsi = df['RSI'].iloc[-1]
             
@@ -100,33 +98,26 @@ def main():
                     'Code': ticker,
                     'Name': ticker_dict[ticker],
                     'RSI': round(current_rsi, 2),
-                    '거래대금_중간값(억)': round(recent_median / 100000000, 1)
+                    'Value': round(recent_median / 100000000, 1)
                 })
         except:
             continue
 
-    print(f"\n✅ 기술적 조건 통과: {len(candidates)}종목. 이제 실시간 영업이익 흑자 여부를 검증합니다.")
+    # 흑자 기업 검증
+    final_picks = [c for c in candidates if is_recent_operating_profit_positive(c['Code'])]
     
-    final_picks = []
-    for cand in candidates:
-        # 네이버 금융 데이터로 최신 영업이익 확인
-        if is_recent_operating_profit_positive(cand['Code']):
-            final_picks.append(cand)
-        time.sleep(0.1) # 서버 부하 방지용 짧은 휴식
-
-    # 결과 출력
-    print("\n" + "="*70)
-    print(f"🏆 최종 필터링 결과 (RSI {TARGET_RSI} 이하 & 유동성 우량 & 흑자 기업)")
-    print("="*70)
-    
+    # 디스코드 메시지 구성
     if not final_picks:
-        print("현재 조건에 부합하는 종목이 없습니다.")
+        message = f"📅 {end_date.strftime('%Y-%m-%d')} 분석 결과\n조건에 맞는 종목이 없습니다."
     else:
-        result_df = pd.DataFrame(final_picks)
-        # RSI가 낮은 순(더 많이 과매도된 순)으로 정렬
-        result_df = result_df.sort_values(by='RSI').reset_index(drop=True)
-        print(result_df.to_string(index=False))
-    print("="*70)
+        message = f"🏆 **{end_date.strftime('%Y-%m-%d')} 우량 낙폭과대 종목** 🏆\n"
+        message += "*(조건: RSI 40이하, 거래대금 중간값 30억↑, 영업이익 흑자)*\n\n"
+        for p in final_picks:
+            message += f"• **{p['Name']}**({p['Code']}) | RSI: `{p['RSI']}` | 거래대금(중간): `{p['Value']}억` \n"
+
+    # 전송
+    send_discord_message({"content": message})
+    print(message)
 
 if __name__ == "__main__":
     main()
