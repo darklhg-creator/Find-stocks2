@@ -1,112 +1,95 @@
 import FinanceDataReader as fdr
-import pandas as pd
+import OpenDartReader
 import requests
-from datetime import datetime
-import warnings
+import pandas as pd
+from datetime import datetime, timedelta
+import time
 
-# pandas 경고 메시지 숨기기 (깔끔한 로그 출력을 위해)
-warnings.filterwarnings('ignore')
-
-# ---------------------------------------------------------
-# 1. 설정 부분 (디스코드 웹훅)
-# ---------------------------------------------------------
-# 본인의 깃허브 시크릿(Secrets)으로 웹훅을 관리하시거나, 아래 변수에 직접 입력해 주세요.
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT"
+# 설정
+DART_API_KEY = '732bd7e69779f5735f3b9c6aae3c4140f7841c3e'
+DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT'
+dart = OpenDartReader(DART_API_KEY)
 
 def send_discord_message(content):
-    if DISCORD_WEBHOOK_URL == "여기에_디스코드_웹훅_주소를_입력하세요":
-        print("⚠️ 디스코드 웹훅 URL이 설정되지 않아 메시지를 전송하지 않습니다.")
-        return
-    
-    data = {"content": content}
+    # 메시지가 너무 길 경우를 대비해 2000자씩 끊어서 발송
+    if len(content) > 1900:
+        chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
+        for chunk in chunks:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk})
+    else:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
+
+def get_disparity(code):
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json=data)
-    except Exception as e:
-        print(f"디스코드 전송 실패: {e}")
+        # 최근 40일치 데이터 로드 (20일 이격도 계산용)
+        df = fdr.DataReader(code, (datetime.now() - timedelta(days=50)).strftime('%Y-%m-%d'))
+        if len(df) < 20: return None
+        
+        ma20 = df['Close'].rolling(window=20).mean()
+        current_price = df['Close'].iloc[-1]
+        disparity = (current_price / ma20.iloc[-1]) * 100
+        return disparity
+    except:
+        return None
 
-# ---------------------------------------------------------
-# 2. 메인 실행 로직
-# ---------------------------------------------------------
+def check_profit_fact(corp_name):
+    """최근 공시 기준 영업이익 흑자 여부 팩트체크"""
+    try:
+        # 2024년 사업보고서(연간) 및 2025년 3분기보고서(분기) 조회
+        # 2026년 2월 기준 가장 신뢰도 높은 최신 데이터
+        annual = dart.finstate_all(corp_name, 2024, '11011')
+        a_op = annual[annual['account_nm'] == '영업이익']['thstrm_amount'].values[0]
+        
+        quarter = dart.finstate_all(corp_name, 2025, '11014')
+        q_op = quarter[quarter['account_nm'] == '영업이익']['thstrm_amount'].values[0]
+        
+        a_val = int(a_op.replace(',', ''))
+        q_val = int(q_op.replace(',', ''))
+        
+        # 둘 다 흑자인 경우만 통과
+        if a_val > 0 and q_val > 0:
+            return True, format(a_val, ','), format(q_val, ',')
+        return False, 0, 0
+    except:
+        return False, 0, 0
+
 def main():
-    print("주도주 탐색 스크립트 시작...")
+    print("스크리닝 시작 (KOSPI 500 / KOSDAQ 1000)...")
     
-    # 한국거래소(KRX) 상장 종목 전체 가져오기
-    df_total = fdr.StockListing('KRX')
-    all_analyzed = []
-
-    # 전체 종목을 순회하며 조건 검색
-    for idx, row in df_total.iterrows():
-        code = row['Code']
-        name = row['Name']
+    # 1. 대상 종목 수집 및 필터링 (ETF 제외)
+    kospi = fdr.StockListing('KOSPI')
+    kosdaq = fdr.StockListing('KOSDAQ')
+    
+    # 업종(Sector) 데이터가 있는 것만 남기면 ETF/ETN이 제거됨
+    target_kospi = kospi.dropna(subset=['Sector']).head(500)
+    target_kosdaq = kosdaq.dropna(subset=['Sector']).head(1000)
+    
+    total_targets = pd.concat([target_kospi, target_kosdaq])
+    
+    found_stocks = []
+    
+    for _, row in total_targets.iterrows():
+        code, name = row['Code'], row['Name']
         
-        # 주식(스팩, 우선주 등 제외) 필터링이 필요하다면 여기에 추가 가능
-        
-        try:
-            # 일봉/주봉/월봉 분석을 위해 데이터를 넉넉히 가져옴 (약 1년치)
-            df_daily = fdr.DataReader(code).tail(200) 
-            if len(df_daily) < 60: 
-                continue
+        # 1. 이격도 90 이하 필터링
+        disp = get_disparity(code)
+        if disp and disp <= 90:
+            # 2. DART 영업이익 팩트체크
+            is_ok, a_op, q_op = check_profit_fact(name)
+            if is_ok:
+                found_stocks.append(f"📌 **{name}** ({code})\n- 이격도: {disp:.2f}\n- '24년 영업이익: {a_op}원\n- '25년 3Q 영업이익: {q_op}원")
+                print(f"찾음: {name}")
             
-            # 1. 일봉 이격도 체크 (기존 로직)
-            current_price = df_daily['Close'].iloc[-1]
-            ma20_daily = df_daily['Close'].rolling(window=20).mean().iloc[-1]
-            disparity = round((current_price / ma20_daily) * 100, 1)
-            
-            # 기본 조건: 이격도 95% 이하인 낙폭 과대주만 일단 대상
-            if disparity > 95.0: 
-                continue
+            # API 과부하 방지를 위한 짧은 휴식 (DART 요청 시)
+            time.sleep(0.1)
 
-            # ---------------------------------------------------------
-            # 2. 주봉/월봉 상승전환 분석
-            # ---------------------------------------------------------
-            # 주봉 변환 (W: 일요일 기준 일주일)
-            df_weekly = df_daily['Close'].resample('W').last()
-            ma5_weekly = df_weekly.rolling(window=5).mean()
-            
-            # 주봉 상승전환 시그널: 5주선이 하락을 멈추고 상승하거나, 종가가 5주선 돌파
-            is_weekly_up = (df_weekly.iloc[-1] > ma5_weekly.iloc[-1]) and (df_weekly.iloc[-2] <= ma5_weekly.iloc[-2])
-            
-            # 월봉 변환 (M: 월말 기준)
-            df_monthly = df_daily['Close'].resample('M').last()
-            # 월봉 상승전환 시그널: 이번 달 종가가 지난달 종가보다 높음 (양봉/반등)
-            is_monthly_rebound = df_monthly.iloc[-1] > df_monthly.iloc[-2]
-
-            # 최종 필터: 낙폭과대(이격도) + 주봉 돌파 + 월봉 반등
-            if is_weekly_up or is_monthly_rebound:
-                all_analyzed.append({
-                    'name': name, 
-                    'code': code, 
-                    'disparity': disparity,
-                    'status': "주봉돌파" if is_weekly_up else "월봉반등"
-                })
-        except Exception as e:
-            # 개별 종목에서 에러가 나도 전체 스크립트가 멈추지 않도록 처리
-            continue
-
-    # ---------------------------------------------------------
-    # 3. 결과 정리 및 디스코드 전송
-    # ---------------------------------------------------------
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    
-    if len(all_analyzed) == 0:
-        msg = f"[{today_str}] 조건에 맞는 종목이 없습니다."
-        print(msg)
-        send_discord_message(msg)
-        return
-
-    # 이격도 순으로 정렬 (가장 많이 떨어진 종목부터)
-    all_analyzed = sorted(all_analyzed, key=lambda x: x['disparity'])
-
-    msg = f"**[{today_str}] 낙폭과대 반등 예상 종목 리스트**\n"
-    for item in all_analyzed:
-        msg += f"- {item['name']} ({item['code']}) | 이격도: {item['disparity']}% | 상태: {item['status']}\n"
-    
-    # Github Actions 로그 확인용 출력
-    print(msg)
-    
-    # 디스코드 전송
-    send_discord_message(msg)
-    print("스크립트 실행 및 전송 완료!")
+    # 결과 전송
+    if found_stocks:
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+        header = f"🚀 **[{now_str}] 이격도 90 이하 & 흑자 종목 스캔 결과**\n"
+        send_discord_message(header + "\n" + "\n\n".join(found_stocks))
+    else:
+        send_discord_message("🔍 현재 조건(이격도 90 이하 & 흑자)에 부합하는 종목이 없습니다.")
 
 if __name__ == "__main__":
     main()
