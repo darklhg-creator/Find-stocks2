@@ -4,7 +4,7 @@ import pandas as pd
 import requests
 from datetime import datetime
 
-# 사용자님의 디스코드 웹후크 URL
+# 사용자 디스코드 웹후크 URL
 DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT'
 
 def send_discord_message(content):
@@ -19,20 +19,24 @@ def run_analysis():
     print(f"--- {today_str} 분석 시작 ---")
     
     try:
-        # 'KRX' 대신 'KOSPI'와 'KOSDAQ'을 각각 불러와서 합치면 Sector 정보가 더 정확합니다.
-        df_kospi = fdr.StockListing('KOSPI')
-        df_kosdaq = fdr.StockListing('KOSDAQ')
-        df_krx = pd.concat([df_kospi, df_kosdaq])
+        # 1. KRX 전체 종목 리스트 호출 (가장 최신 규격 반영)
+        df_krx = fdr.StockListing('KRX')
 
-        # 'Sector' 컬럼이 있는지 확인 (에러 방지)
-        if 'Sector' not in df_krx.columns:
-            # 컬럼명이 다를 경우를 대비해 전체 컬럼 출력 (디버깅용)
-            print(f"Available columns: {df_krx.columns}")
-            send_discord_message("❌ 에러: 데이터에 'Sector' 항목이 없습니다. 관리자 확인 필요.")
+        # 2. 컬럼명 유연하게 대처 (Sector가 없으면 Industry나 다른 이름 확인)
+        target_col = None
+        for col in ['Sector', 'Industry', 'Category', '업종']:
+            if col in df_krx.columns:
+                target_col = col
+                break
+        
+        if not target_col:
+            # 컬럼을 못 찾으면 현재 컬럼 목록을 디코로 보내고 종료
+            cols = ", ".join(df_krx.columns)
+            send_discord_message(f"❌ 데이터 구조 오류: 업종 컬럼을 찾을 수 없습니다.\n현재 컬럼: {cols}")
             return
 
-        # 업종명에 '반도체'가 포함된 종목 추출
-        semi_df = df_krx[df_krx['Sector'].str.contains('반도체', na=False)].copy()
+        # 3. 업종명에 '반도체'가 포함된 종목 필터링
+        semi_df = df_krx[df_krx[target_col].str.contains('반도체', na=False)].copy()
         
     except Exception as e:
         send_discord_message(f"❌ 데이터 로드 실패: {e}")
@@ -40,20 +44,22 @@ def run_analysis():
 
     target_list = []
     
-    # 시가총액 상위 종목부터 분석 (너무 많으면 깃허브에서 끊길 수 있어 100개 제한)
-    search_count = 0
-    for _, row in semi_df.iterrows():
-        if search_count >= 100: break
-        
-        ticker = row['Symbol']
+    # 4. 이격도 분석 (상위 50개 종목으로 제한하여 안정성 확보)
+    for index, row in semi_df.head(50).iterrows():
+        ticker = row['Code'] if 'Code' in row else row['Symbol']
         name = row['Name']
-        # yfinance용 티커 변환
-        full_ticker = ticker + (".KS" if row['Code'] in df_kospi['Symbol'].values else ".KQ")
+        
+        # 시장 구분 (KOSPI/KOSDAQ)에 따른 티커 설정
+        market = row.get('Market', '')
+        suffix = ".KS" if "KOSPI" in market.upper() else ".KQ"
+        full_ticker = ticker + suffix
         
         try:
+            # 데이터 가져오기
             data = yf.download(full_ticker, period="40d", progress=False)
             if len(data) < 20: continue
 
+            # 이격도 계산
             data['MA20'] = data['Close'].rolling(window=20).mean()
             current_price = float(data['Close'].iloc[-1])
             ma20 = float(data['MA20'].iloc[-1])
@@ -62,11 +68,10 @@ def run_analysis():
             # 사용자 매매 기준: 이격도 90 이하
             if disparity <= 90:
                 target_list.append(f"✅ **{name}** ({ticker})\n   └ 이격도: {disparity:.2f}% | 현재가: {int(current_price):,}원")
-                search_count += 1
         except:
             continue
 
-    # 결과 전송
+    # 5. 결과 전송
     if target_list:
         msg = f"📢 **{today_str} 반도체 이격도 90 이하 종목**\n\n" + "\n".join(target_list)
         msg += "\n\n💡 *영업이익 흑자 및 수급(외인/기관)을 꼭 확인하세요!*"
