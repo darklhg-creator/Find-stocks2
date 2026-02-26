@@ -1,120 +1,66 @@
 import FinanceDataReader as fdr
-import OpenDartReader
-import requests
+import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-import sys
-import time
+import requests
+from datetime import datetime
 
-# ==========================================
-# 0. 사용자 설정
-# ==========================================
-DART_API_KEY = '732bd7e69779f5735f3b9c6aae3c4140f7841c3e'
+# 사용자님이 제공하신 디스코드 웹후크 URL
 DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1474739516177911979/IlrMnj_UABCGYJiVg9NcPpSVT2HoT9aMNpTsVyJzCK3yS9LQH9E0WgbYB99FHVS2SUWT'
 
-dart = OpenDartReader(DART_API_KEY)
-
-# [한국 시간 설정]
-KST_TIMEZONE = timezone(timedelta(hours=9))
-CURRENT_KST = datetime.now(KST_TIMEZONE)
-TARGET_DATE = CURRENT_KST.strftime("%Y-%m-%d")
-
-# ==========================================
-# 1. 공통 함수
-# ==========================================
 def send_discord_message(content):
+    data = {"content": content}
     try:
-        if len(content) > 1900:
-            chunks = [content[i:i+1900] for i in range(0, len(content), 1900)]
-            for chunk in chunks:
-                requests.post(DISCORD_WEBHOOK_URL, json={'content': chunk})
-        else:
-            requests.post(DISCORD_WEBHOOK_URL, json={'content': content})
+        response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+        return response.status_code
     except Exception as e:
-        print(f"디스코드 전송 실패: {e}")
+        print(f"메시지 전송 에러: {e}")
 
-def get_op_data(corp_name):
-    """DART에서 영업이익 수치 가져오기 (단위: 억)"""
+def run_analysis():
+    # 2026-02-26 목요일 체크
+    today_str = datetime.now().strftime('%Y-%m-%d %A')
+    print(f"--- {today_str} 반도체 이격도 분석 시작 ---")
+    
     try:
-        # 24년 연간 (사업보고서)
-        res_a = dart.finstate(corp_name, 2024, '11011')
-        op_a_row = res_a[res_a['account_nm'].str.contains('영업이익', na=False)]
-        val_a = int(int(op_a_row.iloc[0]['thstrm_amount'].replace(',', '')) / 100000000) if not op_a_row.empty else 0
-        
-        # 25년 3분기 (3분기보고서)
-        res_q = dart.finstate(corp_name, 2025, '11014')
-        op_q_row = res_q[res_q['account_nm'].str.contains('영업이익', na=False)]
-        val_q = int(int(op_q_row.iloc[0]['thstrm_amount'].replace(',', '')) / 100000000) if not op_q_row.empty else 0
-        
-        return val_a, val_q
-    except:
-        return "N/A", "N/A"
-
-# ==========================================
-# 2. 메인 로직
-# ==========================================
-def main():
-    print(f"[{TARGET_DATE}] 고속 분석 시작 (KOSPI 50 / KOSDAQ 100)")
-
-    try:
-        # 상위 종목 필터링 (시총 순서로 가져옴)
-        df_kospi = fdr.StockListing('KOSPI').head(50)
-        df_kosdaq = fdr.StockListing('KOSDAQ').head(100)
-        df_total = pd.concat([df_kospi, df_kosdaq])
-        
-        results_list = []
-        print(f"📡 총 {len(df_total)}개 핵심 종목 분석 중...")
-
-        for idx, row in df_total.iterrows():
-            code, name = row['Code'], row['Name']
-            try:
-                # 이격도 계산 (최근 30일 데이터 활용)
-                df = fdr.DataReader(code).tail(30)
-                if len(df) < 20: continue
-                
-                ma20 = df['Close'].rolling(window=20).mean().iloc[-1]
-                disparity = round((df['Close'].iloc[-1] / ma20) * 100, 1)
-
-                # [필터] 이격도 90 이하
-                if disparity <= 90.0:
-                    ann_op, qua_op = get_op_data(name)
-                    
-                    # 수치 문자열 처리 (+ 부호 추가)
-                    a_str = f"+{ann_op}" if isinstance(ann_op, int) and ann_op > 0 else f"{ann_op}"
-                    q_str = f"+{qua_op}" if isinstance(qua_op, int) and qua_op > 0 else f"{qua_op}"
-                    
-                    results_list.append({
-                        'name': name[:8],
-                        'disp': disparity,
-                        'ann': a_str,
-                        'qua': q_str
-                    })
-                    print(f"📍 발견: {name} ({disparity})")
-                    time.sleep(0.1)
-            except:
-                continue
-
-        # 3. 디스코드 표 형식 구성
-        if results_list:
-            # 이격도 낮은 순으로 정렬
-            results_list = sorted(results_list, key=lambda x: x['disp'])
-            
-            table_header = f"{'종목명':<10} | {'이격':<5} | {'24년익':>7} | {'25.3Q':>7}\n"
-            table_header += "-" * 45 + "\n"
-            
-            table_body = ""
-            for r in results_list:
-                table_body += f"{r['name']:<10} | {r['disp']:<5} | {r['ann']:>8} | {r['qua']:>8}\n"
-            
-            report = f"### 📊 핵심 종목 이격도 분석 ({TARGET_DATE})\n"
-            report += "```\n" + table_header + table_body + "```"
-            send_discord_message(report)
-            print(f"✅ {len(results_list)}개 종목 전송 완료.")
-        else:
-            send_discord_message(f"🔍 [{TARGET_DATE}] 상위 150개 중 이격도 90% 이하 종목이 없습니다.")
-
+        # 한국거래소 종목 리스트
+        df_krx = fdr.StockListing('KRX')
+        # 업종명에 '반도체'가 포함된 종목만 추출
+        semi_df = df_krx[df_krx['Sector'].str.contains('반도체', na=False)].copy()
     except Exception as e:
-        send_discord_message(f"❌ 실행 중 에러 발생: {e}")
+        send_discord_message(f"❌ 데이터 로드 실패: {e}")
+        return
+
+    target_list = []
+    
+    # 시가총액 상위 100개 중 이격도 낮은 것 탐색 (실행 시간 고려)
+    for _, row in semi_df.head(100).iterrows():
+        ticker = row['Symbol']
+        name = row['Name']
+        full_ticker = ticker + (".KS" if row['Market'] == 'KOSPI' else ".KQ")
+        
+        try:
+            # 최근 40일치 데이터로 20일 이동평균 계산
+            data = yf.download(full_ticker, period="40d", progress=False)
+            if len(data) < 20: continue
+
+            data['MA20'] = data['Close'].rolling(window=20).mean()
+            current_price = float(data['Close'].iloc[-1])
+            ma20 = float(data['MA20'].iloc[-1])
+            disparity = (current_price / ma20) * 100
+
+            # 사용자 매매 기준: 이격도 90 이하
+            if disparity <= 90:
+                target_list.append(f"✅ **{name}** ({ticker})\n   └ 이격도: {disparity:.2f}% | 현재가: {int(current_price):,}원")
+        except:
+            continue
+
+    # 디스코드 전송
+    if target_list:
+        msg = f"📢 **{today_str} 반도체 이격도 90 이하 종목**\n\n" + "\n".join(target_list)
+        msg += "\n\n💡 *영업이익 흑자 및 수급(외인/기관)을 꼭 확인하세요!*"
+    else:
+        msg = f"ℹ️ **{today_str}**\n현재 이격도 90 이하인 반도체 종목이 없습니다."
+
+    send_discord_message(msg)
 
 if __name__ == "__main__":
-    main()
+    run_analysis()
