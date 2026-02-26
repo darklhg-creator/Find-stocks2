@@ -20,36 +20,41 @@ def run_analysis():
     print(f"--- {today_str} 분석 시작 ---")
     
     try:
-        # 1. 시세 데이터(KRX)와 종목 상세 정보(KRX-DESC)를 각각 가져옴
-        df_list = fdr.StockListing('KRX') # 현재 컬럼: Code, Name, Market 등
-        df_desc = fdr.StockListing('KRX-DESC') # 여기 'Sector' 업종 정보가 있음
-        
-        # 2. 'Code'와 'Symbol' 기준으로 두 데이터를 합침 (Merge)
-        # KRX-DESC의 'Symbol' 컬럼이 종목코드임
-        df_krx = pd.merge(df_list, df_desc[['Symbol', 'Sector']], left_on='Code', right_on='Symbol', how='left')
+        # 1. 시세 데이터(Code 포함)와 상세 데이터(Sector 포함) 가져오기
+        df_list = fdr.StockListing('KRX')
+        df_desc = fdr.StockListing('KRX-DESC')
 
-        # 3. 업종명에 '반도체'가 포함된 종목 필터링
-        # Sector 컬럼이 존재하므로 이제 에러가 나지 않습니다.
+        # 2. 컬럼명이 달라도 대응할 수 있도록 이름 변경 후 병합
+        # df_list는 'Code'를 사용, df_desc는 'Symbol'을 사용함
+        df_desc = df_desc[['Symbol', 'Sector']].rename(columns={'Symbol': 'Code'})
+        
+        # 'Code' 컬럼을 기준으로 두 데이터 합치기
+        df_krx = pd.merge(df_list, df_desc, on='Code', how='left')
+
+        # 3. 반도체 종목 필터링
         semi_df = df_krx[df_krx['Sector'].str.contains('반도체', na=False)].copy()
         
         if semi_df.empty:
-            send_discord_message(f"ℹ️ {today_str}: 반도체 업종 종목을 찾지 못했습니다. 데이터 형식을 재점검합니다.")
-            return
+            # 만약 '반도체'로 검색이 안 되면 '전자부품' 등 유사 업종까지 포함 시도
+            semi_df = df_krx[df_krx['Sector'].str.contains('전자부품|반도체', na=False)].copy()
             
     except Exception as e:
-        send_discord_message(f"❌ 데이터 로드 및 병합 실패: {e}")
+        send_discord_message(f"❌ 데이터 병합 실패: {e}\n(현재 사용 중인 데이터 컬럼 확인이 필요합니다)")
         return
 
     target_list = []
     
-    # 4. 상위 50개 종목 이격도 분석
+    # 4. 분석 대상 추출 (효율성을 위해 시가총액 상위 50개 우선)
+    # Marcap(시가총액) 기준으로 내림차순 정렬
+    semi_df = semi_df.sort_values(by='Marcap', ascending=False)
+
     for index, row in semi_df.head(50).iterrows():
         ticker = row['Code']
         name = row['Name']
         
-        # 시장 구분 (KOSPI/KOSDAQ)에 따른 티커 설정
-        market = row.get('MarketId', '')
-        suffix = ".KS" if market == "STK" else ".KQ" # STK=코스피, KSQ=코스닥
+        # MarketId를 기준으로 .KS(코스피) / .KQ(코스닥) 구분
+        market_id = row.get('MarketId', '')
+        suffix = ".KS" if market_id == "STK" else ".KQ"
         full_ticker = ticker + suffix
         
         try:
